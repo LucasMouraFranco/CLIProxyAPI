@@ -689,7 +689,7 @@ func TestCustomMagicHeaders_CPASessionID_SessionAffinityOnAndOff(t *testing.T) {
 			gotHeaders = nil
 			cfg := &config.Config{
 				Routing: config.RoutingConfig{
-					SessionAffinity: sessionAffinity,
+					SessionAffinity: boolPtr(sessionAffinity),
 				},
 				OpenAICompatibility: []config.OpenAICompatibility{{
 					Name: "compat",
