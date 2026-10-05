@@ -116,6 +116,37 @@ retain the corresponding business operation's fields.
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
 
+### Credential token usage
+
+Each `GET /credentials` entry that has served traffic since the process started
+includes a `token_usage` object. It is kept in memory, so it resets on restart,
+and it does not depend on `usage-statistics-enabled`. Token buckets do not
+overlap: `uncached_input_tokens`, `cache_read_tokens`, and `cache_write_tokens`
+add up to the input that was sent. A burst of `cache_write_tokens` on an
+account usually means a conversation moved to it and its prompt cache was
+rebuilt.
+
+```json
+{
+  "token_usage": {
+    "requests": 42,
+    "uncached_input_tokens": 1800,
+    "output_tokens": 52000,
+    "cache_read_tokens": 3100000,
+    "cache_write_tokens": 140000,
+    "since": "2026-10-05T11:00:00Z",
+    "last_seen": "2026-10-05T12:24:10Z",
+    "recent": [
+      { "time": "2026-10-05T12:20:00Z", "requests": 3, "uncached_input_tokens": 90,
+        "output_tokens": 4100, "cache_read_tokens": 260000, "cache_write_tokens": 9000 }
+    ]
+  }
+}
+```
+
+`recent` always has 18 ten-minute buckets (three hours), oldest first; idle
+buckets have zero counts.
+
 ## OAuth
 
 The login URL is shared by all providers. Set the required `provider` query
