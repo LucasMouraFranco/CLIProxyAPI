@@ -137,7 +137,15 @@ access:
 
 # Routing strategy for selecting credentials when multiple match.
 routing:
-  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first
+  strategy: "round-robin" # round-robin (default), weighted-round-robin, fill-first, soonest-reset
+  # soonest-reset drains the account whose weekly quota window resets soonest, so quota that
+  # is about to expire gets used first. It skips accounts at their 5-hour or weekly limit,
+  # breaks ties (same reset minute) by most remaining weekly quota and then round-robin, and
+  # puts accounts with an unknown reset last. Reset times come from the rate-limit headers on
+  # each account's own responses (Anthropic unified headers, Codex x-codex-* headers), so an
+  # account's reset is unknown until it has served a request since startup. Claude requests
+  # to Fable models use the Fable-specific 7-day bucket when it is reported. Sessions bound by
+  # session-affinity stay on their account while it is usable.
   # weighted-round-robin uses each credential's integer weight (default 1, maximum 1,000,000).
   # Non-positive weights exclude the credential while this strategy is active.
   # For OAuth/file credentials, add a top-level numeric "weight" field to the auth JSON.

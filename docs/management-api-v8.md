@@ -92,6 +92,7 @@ retain the corresponding business operation's fields.
 | `/requests/api-call` | POST | Make an authenticated upstream call. |
 | `/routing/cooldown/reset` | POST | Clear credential cooldown. |
 | `/routing/model-definitions/<channel>` | GET | Get model definitions. |
+| `/routing/next?provider=<p>&model=<m>` | GET | Preview which credential the routing strategy picks next for a new session. Both parameters are optional; `provider` accepts a comma-separated list and defaults to every provider with credentials. |
 | `/observability/logs` | GET, DELETE | Read or clear application logs. |
 | `/observability/logs/errors` | GET | List error-log files. |
 | `/observability/logs/errors/<name>` | GET | Download an error-log file. |
@@ -114,6 +115,19 @@ retain the corresponding business operation's fields.
 | `/plugins/store` | GET | List the plugin store. |
 | `/plugins/store/<id>/install` | POST | Install or update a plugin. |
 | `/plugins/<id>/quota` | GET, POST, DELETE | Read, fetch, or reset plugin quota. |
+
+### Routing preview
+
+`GET /routing/next` returns `{"previews": [...]}` with one entry per provider.
+Each entry reports the `strategy`, whether `session_affinity` is on (bound
+sessions keep their credential; the preview describes requests without a
+binding), the `auth_id` that would be picked next, and the available
+`candidates` in selection order. For `soonest-reset`, candidates also carry the
+parsed `weekly` and `five_hour` windows (`used_percent`, `reset_at`) and a
+`skip_reason` (`five_hour_limit` or `weekly_limit`) for accounts it avoids.
+Credentials that are cooling down are not listed. The preview does not change
+round-robin state. `weighted-round-robin` and plugin schedulers do not report
+previews.
 
 ## OAuth
 
