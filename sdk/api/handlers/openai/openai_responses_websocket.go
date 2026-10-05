@@ -373,7 +373,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		return auth, ok
 	}
 	upstreamModeForAuth := func(auth *coreauth.Auth) string {
-		if auth != nil && websocketUpstreamSupportsIncrementalInput(auth.Attributes, auth.Metadata) {
+		if auth != nil && websocketUpstreamSupportsIncrementalInput(auth) {
 			provider := strings.ToLower(strings.TrimSpace(auth.Provider))
 			if provider == "codex" || provider == "xai" {
 				return responsesWebsocketUpstreamModeWS
@@ -578,7 +578,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		var updatedLastRequest []byte
 		var errMsg *interfaces.ErrorMessage
 		previousResponseID := strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String())
-		isPrewarm := !useUpstreamWebsocketPassthrough && shouldHandleResponsesWebsocketPrewarmLocally(payload, false)
+		isWarmupRequest := shouldHandleResponsesWebsocketPrewarmLocally(payload, false)
+		isPrewarm := !useUpstreamWebsocketPassthrough && isWarmupRequest
 		if pendingPrewarmID != "" && previousResponseID != "" {
 			if previousResponseID != pendingPrewarmID {
 				errMsg = responsesWebsocketPreviousResponseNotFoundError()
@@ -648,26 +649,38 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		requestJSON = h.prepareCodexMultiAgentV2Tools(c, requestJSON)
 		requestJSON = h.prepareCodexOrphanDelegation(c, requestJSON)
 
-		if isPrewarm {
-			if updated, errDelete := sjson.DeleteBytes(requestJSON, "generate"); errDelete == nil {
-				requestJSON = updated
+		// acknowledgePrewarmLocally answers a warm-up without reaching the upstream and
+		// keeps the warm-up input as the transcript root for the follow-up request.
+		acknowledgePrewarmLocally := func(warmupRequest, warmupLastRequest []byte) error {
+			if len(warmupLastRequest) == 0 {
+				warmupLastRequest = warmupRequest
 			}
-			if updated, errDelete := sjson.DeleteBytes(updatedLastRequest, "generate"); errDelete == nil {
-				updatedLastRequest = updated
+			if updated, errDelete := sjson.DeleteBytes(warmupRequest, "generate"); errDelete == nil {
+				warmupRequest = updated
 			}
-			lastRequest = updatedLastRequest
+			if updated, errDelete := sjson.DeleteBytes(warmupLastRequest, "generate"); errDelete == nil {
+				warmupLastRequest = updated
+			}
+			lastRequest = warmupLastRequest
 			lastResponseOutput = []byte("[]")
 			observedCompaction.clear()
 			lastResponseID = ""
 			lastResponsePendingToolCallIDs = nil
-			prewarmID, errWrite := writeResponsesWebsocketSyntheticPrewarm(c, writer, requestJSON, wsTimelineLog, passthroughSessionID)
+			prewarmID, errWrite := writeResponsesWebsocketSyntheticPrewarm(c, writer, warmupRequest, wsTimelineLog, passthroughSessionID)
 			if errWrite != nil {
+				return errWrite
+			}
+			pendingPrewarmID = prewarmID
+			return nil
+		}
+		if isPrewarm {
+			if errWrite := acknowledgePrewarmLocally(requestJSON, updatedLastRequest); errWrite != nil {
 				wsTerminateErr = errWrite
 				return
 			}
-			pendingPrewarmID = prewarmID
 			continue
 		}
+		warmupRequestJSON, warmupLastRequest := requestJSON, updatedLastRequest
 
 		var toolCacheTurn *responsesWebsocketToolCacheTurn
 		nextLastRequest := lastRequest
@@ -690,6 +703,8 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		pinnedAuthAttempted := false
 		cliCtx, cliCancel := h.GetContextWithCancel(h, c, executionParent)
 		cliCtx = cliproxyexecutor.WithDownstreamWebsocket(cliCtx)
+		cliCtx = cliproxyexecutor.WithUpstreamHTTPFallbackTracker(cliCtx)
+		var selectedTransportAuthID atomic.Value
 		if duplexInput != nil {
 			cliCtx = cliproxyexecutor.WithWebsocketInput(cliCtx, duplexInput)
 			cliCtx = cliproxyexecutor.WithWebsocketAuthCheck(cliCtx, func(authID string) bool {
@@ -716,6 +731,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 				return
 			}
 			attemptedUpstreamMode = upstreamModeForAuth(selectedAuth)
+			selectedTransportAuthID.Store(authID)
 			codexDuplexStream.Store(duplexInput != nil && attemptedUpstreamMode == responsesWebsocketUpstreamModeWS && strings.EqualFold(strings.TrimSpace(selectedAuth.Provider), "codex"))
 			preserveNativeOutput.Store(nativeRequest && strings.EqualFold(strings.TrimSpace(selectedAuth.Provider), "codex"))
 		})
@@ -752,9 +768,15 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			passthroughSessionID,
 			responsesWebsocketForwardOptions{
 				preserveCompletionOutput: preserveNativeOutput.Load,
-				duplexStream:             codexDuplexStream.Load,
-				toolCacheTurn:            toolCacheTurn,
-				suppressError:            replayPinnedAuthFailure,
+				duplexStream: func() bool {
+					// A turn that fell back to HTTP/SSE never runs as a duplex websocket stream.
+					authID, _ := selectedTransportAuthID.Load().(string)
+					return codexDuplexStream.Load() && !cliproxyexecutor.UpstreamHTTPFallback(cliCtx, authID)
+				},
+				toolCacheTurn: toolCacheTurn,
+				suppressError: func(errMsg *interfaces.ErrorMessage) bool {
+					return replayPinnedAuthFailure(errMsg) || (isWarmupRequest && responsesWebsocketPrewarmFellBack(errMsg))
+				},
 			},
 		)
 		if errForward != nil {
@@ -771,6 +793,17 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			return
 		}
 		if forwardErrMsg != nil {
+			if isWarmupRequest && responsesWebsocketPrewarmFellBack(forwardErrMsg) {
+				// The upstream websocket could not take the warm-up. Acknowledge it locally,
+				// as for an HTTP-only credential, so the follow-up turn replays the transcript.
+				upstreamMode = responsesWebsocketUpstreamModeHTTP
+				upstreamWebsocketAuthID = ""
+				if errWrite := acknowledgePrewarmLocally(warmupRequestJSON, warmupLastRequest); errWrite != nil {
+					wsTerminateErr = errWrite
+					return
+				}
+				continue
+			}
 			if pinnedAuthAttempted && shouldReleaseResponsesWebsocketPinnedAuth(forwardErrMsg) {
 				forgetPinnedAuth()
 			}
@@ -790,6 +823,11 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 
 		toolCacheTurn.commit()
 		pendingPrewarmID = ""
+		if attemptedUpstreamMode == responsesWebsocketUpstreamModeWS && cliproxyexecutor.UpstreamHTTPFallback(cliCtx, lastAttemptedAuthID) {
+			// The credential served this turn over HTTP/SSE, so no upstream socket holds the
+			// conversation; keep the transcript for full replay on the next turn.
+			attemptedUpstreamMode = responsesWebsocketUpstreamModeHTTP
+		}
 		upstreamMode = attemptedUpstreamMode
 		if upstreamMode == responsesWebsocketUpstreamModeWS {
 			upstreamWebsocketAuthID = lastAttemptedAuthID
@@ -861,6 +899,12 @@ type responsesWebsocketObservedCompactionState struct {
 
 func (s *responsesWebsocketObservedCompactionState) clear() {
 	*s = responsesWebsocketObservedCompactionState{}
+}
+
+// responsesWebsocketPrewarmFellBack reports whether a warm-up failed only because the
+// upstream websocket was unavailable and HTTP/SSE cannot carry a warm-up.
+func responsesWebsocketPrewarmFellBack(errMsg *interfaces.ErrorMessage) bool {
+	return errMsg != nil && cliproxyexecutor.IsUpstreamWebsocketPrewarmFallback(errMsg.Error)
 }
 
 func responsesWebsocketHTTPReplayRequiredError() error {

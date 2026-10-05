@@ -380,12 +380,14 @@ func TestCodexWebsocketsExecutePreservesPreviousResponseIDUpstream(t *testing.T)
 	}
 }
 
-func TestCodexWebsocketsExecuteStreamUpgradeRequiredReturnsWithoutLockingSession(t *testing.T) {
+func TestCodexWebsocketsExecuteStreamUpgradeRequiredFallsBackWithoutLockingSession(t *testing.T) {
 	upgradeAttempts := make(chan struct{}, 2)
+	httpFallbacks := make(chan struct{}, 2)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
-			t.Errorf("unexpected HTTP fallback request: %s %s", r.Method, r.URL.Path)
+			httpFallbacks <- struct{}{}
 			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"error":{"message":"http unavailable"}}`))
 			return
 		}
 		upgradeAttempts <- struct{}{}
@@ -398,13 +400,14 @@ func TestCodexWebsocketsExecuteStreamUpgradeRequiredReturnsWithoutLockingSession
 	const executionSessionID = "ws-upgrade-required-session"
 	t.Cleanup(func() { exec.CloseExecutionSession(executionSessionID) })
 	auth := &cliproxyauth.Auth{
-		ID:       "codex-test",
+		ID:       "codex-upgrade-required-fallback",
 		Provider: "codex",
 		Attributes: map[string]string{
 			"api_key":  "sk-test",
 			"base_url": server.URL,
 		},
 	}
+	t.Cleanup(func() { cliproxyauth.MarkUpstreamWebsocketSuccess(auth.ID) })
 	opts := cliproxyexecutor.Options{
 		SourceFormat:   sdktranslator.FromString("openai-response"),
 		ResponseFormat: sdktranslator.FromString("openai-response"),
@@ -414,36 +417,52 @@ func TestCodexWebsocketsExecuteStreamUpgradeRequiredReturnsWithoutLockingSession
 	}
 	ctx := cliproxyexecutor.WithDownstreamWebsocket(context.Background())
 
-	execute := func(payload string) {
+	execute := func(payload string) error {
 		t.Helper()
 		done := make(chan error, 1)
 		go func() {
-			_, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
+			result, errExecute := exec.ExecuteStream(ctx, auth, cliproxyexecutor.Request{
 				Model:   "gpt-5.4",
 				Payload: []byte(payload),
 			}, opts)
+			if errExecute == nil && result != nil {
+				for chunk := range result.Chunks {
+					if chunk.Err != nil {
+						errExecute = chunk.Err
+					}
+				}
+			}
 			done <- errExecute
 		}()
 
 		select {
 		case errExecute := <-done:
-			if errExecute == nil {
-				t.Fatal("upgrade-required error = nil")
-			}
-			statusErr, ok := errExecute.(interface{ StatusCode() int })
-			if !ok || statusErr.StatusCode() != http.StatusUpgradeRequired {
-				t.Fatalf("upgrade-required error = %T %v, want status 426", errExecute, errExecute)
-			}
+			return errExecute
 		case <-time.After(5 * time.Second):
-			t.Fatal("timed out waiting for upgrade-required error; execution session may still be locked")
+			t.Fatal("timed out waiting for the fallback; execution session may still be locked")
+			return nil
 		}
 	}
 
-	execute(`{"model":"gpt-5.4","generate":false,"input":[]}`)
-	execute(`{"model":"gpt-5.4","previous_response_id":"resp-1","input":[{"type":"message","id":"msg-2"}]}`)
+	// A warm-up has no HTTP equivalent: it must not generate over HTTP.
+	if errWarmup := execute(`{"model":"gpt-5.4","generate":false,"input":[]}`); !cliproxyexecutor.IsUpstreamWebsocketPrewarmFallback(errWarmup) {
+		t.Fatalf("warm-up error = %T %v, want the prewarm fallback signal", errWarmup, errWarmup)
+	}
+	if got := len(httpFallbacks); got != 0 {
+		t.Fatalf("warm-up reached the HTTP transport %d times, want 0", got)
+	}
 
+	// A full request falls back to HTTP/SSE and does not stay locked on the session.
+	errFull := execute(`{"model":"gpt-5.4","input":[{"type":"message","id":"msg-2"}]}`)
+	statusErr, ok := errFull.(interface{ StatusCode() int })
+	if !ok || statusErr.StatusCode() != http.StatusInternalServerError {
+		t.Fatalf("full request error = %T %v, want the HTTP transport's status 500", errFull, errFull)
+	}
 	if got := len(upgradeAttempts); got != 2 {
 		t.Fatalf("websocket upgrade attempts = %d, want 2", got)
+	}
+	if got := len(httpFallbacks); got != 1 {
+		t.Fatalf("HTTP fallback requests = %d, want 1", got)
 	}
 }
 
