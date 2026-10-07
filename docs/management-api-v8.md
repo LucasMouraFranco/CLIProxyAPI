@@ -126,6 +126,8 @@ binding), the `auth_id` that would be picked next, and the available
 `candidates` in selection order. For `soonest-reset`, candidates also carry the
 parsed `weekly` and `five_hour` windows (`used_percent`, `reset_at`) and a
 `skip_reason` (`five_hour_limit` or `weekly_limit`) for accounts it avoids.
+A subscription account it has not heard from since startup is listed first,
+without windows, until it has had its one learning pick.
 Credentials that are cooling down are not listed. The preview does not change
 round-robin state. `weighted-round-robin` and plugin schedulers do not report
 previews.

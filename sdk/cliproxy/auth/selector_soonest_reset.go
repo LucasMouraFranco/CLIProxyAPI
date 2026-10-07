@@ -21,6 +21,10 @@ const (
 	// Reset times are compared at minute precision so accounts sharing a reset
 	// (for example after a provider-wide reset) tie and fall through to the next rule.
 	soonestResetTiePrecision = time.Minute
+	// An account the proxy has not heard from is picked ahead of the ranking once so its
+	// reset time gets learned. If that pick taught nothing (the request failed before any
+	// quota headers came back), it is pulled forward again only after this long.
+	soonestResetLearnRetry = 10 * time.Minute
 )
 
 // Skip reasons reported for credentials the soonest-reset strategy avoids.
@@ -38,10 +42,18 @@ const (
 // Reset times come from the provider quota headers recorded on each credential
 // (Anthropic unified rate-limit headers and Codex x-codex-* headers). For Claude
 // requests to a Fable model the Fable-specific 7-day bucket is used when known.
+//
+// Those headers are only seen on an account's own responses, so after a restart every
+// reset is unknown. A Claude or Codex subscription account the proxy has not heard from
+// yet is therefore picked once ahead of the ranking, which teaches its reset time
+// instead of leaving it last behind the accounts that happened to answer first.
 type SoonestResetSelector struct {
 	mu         sync.Mutex
 	lastPicked map[string]string
-	nowFunc    func() time.Time
+	// lastLearnPick records when an unheard-from account was last picked ahead of the
+	// ranking, so it is tried once rather than on every request.
+	lastLearnPick map[string]time.Time
+	nowFunc       func() time.Time
 }
 
 // QuotaWindow is a parsed quota window from a credential's observed quota signals.
@@ -85,6 +97,8 @@ type soonestResetCandidate struct {
 	weekly     QuotaWindow
 	fiveHour   QuotaWindow
 	skipReason string
+	// learn marks an unheard-from account that goes ahead of the ranking once.
+	learn bool
 }
 
 func (s *SoonestResetSelector) now() time.Time {
@@ -102,8 +116,6 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 		return nil, err
 	}
 	available = preferCodexWebsocketAuths(ctx, provider, available)
-	ranked := rankSoonestReset(available, model, now)
-	ties := leadingSoonestResetTies(ranked)
 
 	key := provider + ":" + canonicalModelKey(model)
 	s.mu.Lock()
@@ -114,16 +126,27 @@ func (s *SoonestResetSelector) Pick(ctx context.Context, provider, model string,
 	if len(s.lastPicked) >= 4096 {
 		s.lastPicked = make(map[string]string)
 	}
+	ranked := rankSoonestReset(available, model, now, s.learnPendingLocked(now))
+	ties := leadingSoonestResetTies(ranked)
 	picked := ties[successorIndex(ties, s.lastPicked[key])]
 	s.lastPicked[key] = picked.ID
+	if ranked[0].learn {
+		if s.lastLearnPick == nil || len(s.lastLearnPick) >= 4096 {
+			s.lastLearnPick = make(map[string]time.Time)
+		}
+		s.lastLearnPick[picked.ID] = now
+	}
 	return picked, nil
 }
 
 // PreviewPick reports the ranked candidates and the next pick without advancing the
-// round-robin state used for ties.
+// round-robin state used for ties or using up a learning pick.
 func (s *SoonestResetSelector) PreviewPick(provider, model string, auths []*Auth) SelectionPreview {
 	now := s.now()
-	ranked := rankSoonestReset(auths, model, now)
+	s.mu.Lock()
+	ranked := rankSoonestReset(auths, model, now, s.learnPendingLocked(now))
+	last := s.lastPicked[provider+":"+canonicalModelKey(model)]
+	s.mu.Unlock()
 	preview := SelectionPreview{Strategy: RoutingStrategySoonestReset, Provider: provider, Model: model}
 	for _, candidate := range ranked {
 		entry := SelectionCandidate{
@@ -143,24 +166,49 @@ func (s *SoonestResetSelector) PreviewPick(provider, model string, auths []*Auth
 		preview.Candidates = append(preview.Candidates, entry)
 	}
 	if ties := leadingSoonestResetTies(ranked); len(ties) > 0 {
-		s.mu.Lock()
-		last := s.lastPicked[provider+":"+canonicalModelKey(model)]
-		s.mu.Unlock()
 		preview.AuthID = ties[successorIndex(ties, last)].ID
 	}
 	return preview
 }
 
+// learnPendingLocked returns a check for accounts that should go ahead of the ranking to
+// learn their reset: learnable accounts not already pulled forward within
+// soonestResetLearnRetry. Callers hold s.mu.
+func (s *SoonestResetSelector) learnPendingLocked(now time.Time) func(*Auth) bool {
+	return func(auth *Auth) bool {
+		if !soonestResetLearnable(auth) {
+			return false
+		}
+		last, tried := s.lastLearnPick[auth.ID]
+		return !tried || now.Sub(last) >= soonestResetLearnRetry
+	}
+}
+
+// soonestResetLearnable reports whether auth is a Claude or Codex subscription account
+// the proxy has not heard from yet, so its reset is unknown only for lack of a response.
+// API keys are billed per request, so they are never pulled forward.
+func soonestResetLearnable(auth *Auth) bool {
+	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
+	case "claude", "codex":
+		return auth.Quota.ObservedAt.IsZero() && !isAPIKeyAuth(auth)
+	default:
+		return false
+	}
+}
+
 // rankSoonestReset orders credentials by the soonest-reset rules. Credentials the
 // quota signals mark as limited sort after usable ones; when every credential is
 // limited they are still ranked so selection never fails on stale signals alone.
-func rankSoonestReset(auths []*Auth, model string, now time.Time) []soonestResetCandidate {
+// Usable credentials that learn reports as due a learning pick come first.
+func rankSoonestReset(auths []*Auth, model string, now time.Time, learn func(*Auth) bool) []soonestResetCandidate {
 	ranked := make([]soonestResetCandidate, 0, len(auths))
 	for _, auth := range auths {
 		if auth == nil {
 			continue
 		}
-		ranked = append(ranked, soonestResetCandidateFor(auth, model, now))
+		candidate := soonestResetCandidateFor(auth, model, now)
+		candidate.learn = learn != nil && learn(auth)
+		ranked = append(ranked, candidate)
 	}
 	sort.SliceStable(ranked, func(i, j int) bool {
 		return soonestResetLess(ranked[i], ranked[j])
@@ -171,6 +219,9 @@ func rankSoonestReset(auths []*Auth, model string, now time.Time) []soonestReset
 func soonestResetLess(a, b soonestResetCandidate) bool {
 	if (a.skipReason == "") != (b.skipReason == "") {
 		return a.skipReason == ""
+	}
+	if a.learn != b.learn {
+		return a.learn
 	}
 	if c := compareSoonestResetTime(a.weekly.ResetAt, b.weekly.ResetAt); c != 0 {
 		return c < 0
@@ -220,6 +271,7 @@ func leadingSoonestResetTies(ranked []soonestResetCandidate) []*Auth {
 	ties := []*Auth{best.auth}
 	for _, candidate := range ranked[1:] {
 		if (candidate.skipReason == "") != (best.skipReason == "") ||
+			candidate.learn != best.learn ||
 			compareSoonestResetTime(candidate.weekly.ResetAt, best.weekly.ResetAt) != 0 ||
 			remainingPercent(candidate.weekly) != remainingPercent(best.weekly) {
 			break
