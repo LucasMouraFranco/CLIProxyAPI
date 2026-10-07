@@ -384,9 +384,24 @@ func isKnownDefaultValue(path []string, node *yaml.Node) bool {
 		return false
 	}
 
-	// Pointer-backed booleans (such as cache-user-id and disable-cooling): explicit false is meaningful and must be preserved.
-	if len(path) > 0 && (path[len(path)-1] == "cache-user-id" || path[len(path)-1] == "disable-cooling") && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
+	// Pointer-backed booleans (such as cache-user-id, disable-cooling, and session-affinity): explicit false is meaningful and must be preserved.
+	if len(path) > 0 && (path[len(path)-1] == "cache-user-id" || path[len(path)-1] == "disable-cooling" || path[len(path)-1] == "session-affinity") && node != nil && node.Kind == yaml.ScalarNode && node.Tag == "!!bool" {
 		return false
+	}
+
+	// A mapping is a default only when every child is a default, so explicit
+	// pointer-backed values nested in a new mapping are kept.
+	if node != nil && node.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(node.Content); i += 2 {
+			keyNode := node.Content[i]
+			if keyNode == nil {
+				continue
+			}
+			if !isKnownDefaultValue(appendPath(path, keyNode.Value), node.Content[i+1]) {
+				return false
+			}
+		}
+		return true
 	}
 
 	// First check if it's a zero value

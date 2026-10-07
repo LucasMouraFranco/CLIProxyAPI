@@ -35,6 +35,7 @@ type routingRuntimeState struct {
 func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	state := routingRuntimeState{
 		strategy:                 "round-robin",
+		sessionAffinity:          true,
 		sessionAffinityTTL:       time.Hour,
 		sessionAffinitySubagents: true,
 	}
@@ -48,7 +49,7 @@ func normalizedRoutingRuntimeState(cfg *config.Config) routingRuntimeState {
 	case "fill-first", "fillfirst", "ff":
 		state.strategy = "fill-first"
 	}
-	state.sessionAffinity = cfg.Routing.SessionAffinity
+	state.sessionAffinity = cfg.Routing.SessionAffinityEnabled()
 	if ttl := strings.TrimSpace(cfg.Routing.SessionAffinityTTL); ttl != "" {
 		if parsed, errParse := time.ParseDuration(ttl); errParse == nil && parsed > 0 {
 			if parsed < time.Second {
