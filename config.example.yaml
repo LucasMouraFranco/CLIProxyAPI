@@ -302,6 +302,14 @@ client:
 # Shared upstream behavior applies to OAuth and API-key credentials.
 upstream:
   codex:
+    # Codex OAuth (subscription) credentials use the upstream Responses WebSocket transport
+    # by default whenever the client talks to /v1/responses over WebSocket (Codex CLI and
+    # desktop do when their provider sets supports_websockets = true). Add "websockets": false
+    # to an auth JSON file to keep that account on HTTP/SSE. Codex API keys stay on HTTP/SSE
+    # unless their entry sets websockets: true.
+    # When a new upstream WebSocket cannot be opened (network error, 426, 5xx, no upgrade),
+    # the turn is served over HTTP/SSE and that account skips new WebSocket dials for 1 minute,
+    # doubling on repeated failures up to 30 minutes. 401/402/403/429 are not retried over HTTP.
     # Experimental full-duplex Codex Responses WebSocket steering (default: false).
     # Keeps one upstream account/model per socket; accepted input is never replayed.
     response-steering: false
@@ -619,7 +627,7 @@ upstream:
 #           weight: 5 # optional: weighted-round-robin share; omitted defaults to 1; maximum 1,000,000
 #           disable-codex-cloaking: false # optional: true disables cloaking; OAuth provider settings do not apply here
 #           alpha-search: false # optional: allow this key to serve /v1/alpha/search via base-url + /alpha/search
-#           websockets: false # optional: use the Codex upstream WebSocket transport
+#           websockets: false # optional: use the Codex upstream WebSocket transport (API keys default to false; OAuth auth files default to true)
 #
 #   # Claude API keys
 #

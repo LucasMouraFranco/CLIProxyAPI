@@ -787,6 +787,9 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry["websockets"] = websockets
+	} else if coreauth.WebsocketsEnabled(auth) {
+		// Codex OAuth credentials use the upstream websocket transport by default.
+		entry["websockets"] = true
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		entry["request_retry"] = requestRetry
