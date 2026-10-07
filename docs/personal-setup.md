@@ -248,9 +248,9 @@ Then run one prompt through `claude-proxy` and `codex-proxy`, and watch the requ
 | --- | --- | --- |
 | `routing.session-affinity` | `true`: a Claude Code or Codex session (including its subagents) stays on one account and only moves when that account is unavailable, so its prompt cache stays warm. | `false` |
 | Codex WebSockets | On for Codex OAuth logins, with automatic fallback to HTTP when the WebSocket can't be opened. Opt an account out with `"websockets": false` in its auth file, or in the dashboard's auth-file editor. Codex API-key entries keep their own `websockets` option, which is off unless you set it. | Off |
-| `routing.strategy` | Set `soonest-reset` yourself (see step 1). It sends new sessions to the usable account whose weekly quota resets soonest, so quota doesn't expire unused. It skips accounts that are exhausted, cooling down or at their 5-hour limit. Accounts with unknown resets go last. | `round-robin` |
+| `routing.strategy` | Set `soonest-reset` yourself (see step 1). It sends new sessions to the usable account whose weekly quota resets soonest, so quota doesn't expire unused. It skips accounts that are exhausted, cooling down or at their 5-hour limit. An account it hasn't heard from yet is tried once first; accounts whose reset is still unknown after that go last. | `round-robin` |
 
-`soonest-reset` learns each account's reset times from response headers. After a restart, an account only ranks by its real reset once it has served a request; until then it counts as unknown.
+`soonest-reset` learns each account's reset times from response headers, and forgets them on restart. So after a restart, each Claude or Codex subscription account gets one new session before the ranking applies, which teaches the proxy its reset. If that request fails before any headers come back, the account is tried again at most every 10 minutes. API keys are never pulled forward, since they are billed per request.
 
 ## Keeping the fork current
 

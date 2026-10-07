@@ -33,6 +33,14 @@ func claudeAuth(id string, weeklyUsed float64, weeklyReset time.Duration, fiveHo
 	return &Auth{ID: id, Provider: "claude", Quota: QuotaState{ObservedAt: soonestResetTestNow, Signals: signals}}
 }
 
+// heardFromWithoutReset builds a Claude credential that has answered since startup but
+// whose response reported no weekly window, so its reset stays unknown.
+func heardFromWithoutReset(id string) *Auth {
+	return &Auth{ID: id, Provider: "claude", Quota: QuotaState{ObservedAt: soonestResetTestNow, Signals: map[string]string{
+		"Anthropic-Ratelimit-Unified-Status": "allowed",
+	}}}
+}
+
 func withFableWindow(auth *Auth, used float64, reset time.Duration) *Auth {
 	auth.Quota.Signals["Anthropic-Ratelimit-Unified-7d_oi-Utilization"] = strconv.FormatFloat(used, 'f', 2, 64)
 	auth.Quota.Signals["Anthropic-Ratelimit-Unified-7d_oi-Reset"] = unixSignal(soonestResetTestNow.Add(reset))
@@ -55,7 +63,7 @@ func TestSoonestResetPicksAccountWhoseWeeklyWindowResetsFirst(t *testing.T) {
 		claudeAuth("claude-a", 0.00, 4*day, 0, 5*time.Hour),
 		claudeAuth("claude-b", 0.42, 1*day, 0.10, 3*time.Hour),
 		claudeAuth("claude-c", 0.00, 5*day, 0, 5*time.Hour),
-		{ID: "claude-unknown", Provider: "claude"},
+		heardFromWithoutReset("claude-unknown"),
 	}
 	for i := 0; i < 3; i++ {
 		if got := pickSoonestReset(t, selector, "claude", "claude-sonnet-5", auths...); got != "claude-b" {
@@ -145,7 +153,7 @@ func TestSoonestResetTreatsUnknownAndExpiredResetsAsLast(t *testing.T) {
 	selector := newSoonestResetTestSelector()
 	day := 24 * time.Hour
 	expired := claudeAuth("claude-a", 0.90, -time.Hour, 0, -time.Hour)
-	unknown := &Auth{ID: "claude-b", Provider: "claude"}
+	unknown := heardFromWithoutReset("claude-b")
 	known := claudeAuth("claude-c", 0.10, 6*day, 0, 5*time.Hour)
 	if got := pickSoonestReset(t, selector, "claude", "claude-sonnet-5", expired, unknown, known); got != "claude-c" {
 		t.Fatalf("pick = %s, want claude-c (the only known reset)", got)
@@ -156,6 +164,70 @@ func TestSoonestResetTreatsUnknownAndExpiredResetsAsLast(t *testing.T) {
 	second := pickSoonestReset(t, selector, "claude", "claude-sonnet-5", expired, unknown)
 	if first == second {
 		t.Fatalf("unknown resets did not rotate: %s then %s", first, second)
+	}
+}
+
+func TestSoonestResetTriesUnheardFromAccountsOnceFirst(t *testing.T) {
+	now := soonestResetTestNow
+	selector := &SoonestResetSelector{nowFunc: func() time.Time { return now }}
+	day := 24 * time.Hour
+	known := claudeAuth("claude-a", 0.10, 1*day, 0, 5*time.Hour)
+	freshB := &Auth{ID: "claude-b", Provider: "claude"}
+	freshC := &Auth{ID: "claude-c", Provider: "claude"}
+	auths := []*Auth{known, freshB, freshC}
+
+	// The preview names the account about to be tried and does not use the try up.
+	for i := 0; i < 2; i++ {
+		if preview := selector.PreviewPick("claude", "claude-sonnet-5", auths); preview.AuthID != "claude-b" {
+			t.Fatalf("preview %d = %s, want claude-b (never heard from)", i, preview.AuthID)
+		}
+	}
+
+	// Each unheard-from account gets one pick ahead of the ranking, then the ranking applies.
+	var picks []string
+	for i := 0; i < 4; i++ {
+		picks = append(picks, pickSoonestReset(t, selector, "claude", "claude-sonnet-5", auths...))
+	}
+	if fmt.Sprint(picks) != "[claude-b claude-c claude-a claude-a]" {
+		t.Fatalf("picks = %v, want each unheard-from account once, then claude-a (soonest reset)", picks)
+	}
+
+	// Accounts that still have not answered are tried once more after the retry interval.
+	now = now.Add(soonestResetLearnRetry)
+	picks = nil
+	for i := 0; i < 3; i++ {
+		picks = append(picks, pickSoonestReset(t, selector, "claude", "claude-sonnet-5", auths...))
+	}
+	if fmt.Sprint(picks) != "[claude-b claude-c claude-a]" {
+		t.Fatalf("picks after retry interval = %v, want claude-b and claude-c once more, then claude-a", picks)
+	}
+
+	// Once an account has answered, its learned reset is ranked like any other.
+	freshB.Quota = claudeAuth("claude-b", 0.10, 12*time.Hour, 0, 5*time.Hour).Quota
+	if got := pickSoonestReset(t, selector, "claude", "claude-sonnet-5", auths...); got != "claude-b" {
+		t.Fatalf("pick = %s, want claude-b (its learned reset is the soonest)", got)
+	}
+}
+
+func TestSoonestResetNeverPullsAPIKeysForward(t *testing.T) {
+	selector := newSoonestResetTestSelector()
+	apiKey := &Auth{ID: "claude-a", Provider: "claude", Attributes: map[string]string{AttributeAPIKey: "test-key"}}
+	known := claudeAuth("claude-b", 0.10, 2*24*time.Hour, 0, 5*time.Hour)
+	for i := 0; i < 2; i++ {
+		if got := pickSoonestReset(t, selector, "claude", "claude-sonnet-5", apiKey, known); got != "claude-b" {
+			t.Fatalf("pick %d = %s, want claude-b (API keys are billed per request)", i, got)
+		}
+	}
+
+	// Codex subscription accounts are learned the same way as Claude ones.
+	codexKnown := &Auth{ID: "codex-a", Provider: "codex", Quota: QuotaState{ObservedAt: soonestResetTestNow, Signals: map[string]string{
+		"X-Codex-Primary-Window-Minutes": "10080",
+		"X-Codex-Primary-Used-Percent":   "10",
+		"X-Codex-Primary-Reset-At":       unixSignal(soonestResetTestNow.Add(24 * time.Hour)),
+	}}}
+	codexFresh := &Auth{ID: "codex-b", Provider: "codex"}
+	if got := pickSoonestReset(t, selector, "codex", "gpt-5.4", codexKnown, codexFresh); got != "codex-b" {
+		t.Fatalf("codex pick = %s, want codex-b (never heard from)", got)
 	}
 }
 
@@ -295,5 +367,62 @@ func TestManagerSoonestResetLearnsResetTimesFromResponseHeaders(t *testing.T) {
 	}
 	if len(preview.Candidates) != 3 || preview.Candidates[2].AuthID != "claude-soonest-c" {
 		t.Fatalf("preview order = %+v, want claude-soonest-c last", preview.Candidates)
+	}
+}
+
+// TestManagerSoonestResetLearnsUnheardFromAccountsAfterRestart covers the restart case end
+// to end: with no reset known yet, each account is tried once, and the resets their
+// responses report then decide the ranking.
+func TestManagerSoonestResetLearnsUnheardFromAccountsAfterRestart(t *testing.T) {
+	ctx := context.Background()
+	const model = "claude-soonest-learn-model"
+	manager := NewManager(nil, nil, nil)
+	manager.SetSelector(&SoonestResetSelector{})
+	manager.RegisterExecutor(schedulerTestExecutor{provider: "claude"})
+	now := time.Now()
+	resets := map[string]time.Duration{
+		"claude-learn-a": 5 * 24 * time.Hour,
+		"claude-learn-b": 20 * time.Hour,
+	}
+	for id := range resets {
+		if _, errRegister := manager.Register(WithSkipPersist(ctx), &Auth{ID: id, Provider: "claude", Status: StatusActive}); errRegister != nil {
+			t.Fatalf("Register(%s): %v", id, errRegister)
+		}
+		registry.GetGlobalRegistry().RegisterClient(id, "claude", []*registry.ModelInfo{{ID: model}})
+		authID := id
+		t.Cleanup(func() { registry.GetGlobalRegistry().UnregisterClient(authID) })
+	}
+	pick := func() string {
+		t.Helper()
+		picked, _, errPick := manager.pickNext(ctx, "claude", model, cliproxyexecutor.Options{}, nil)
+		if errPick != nil {
+			t.Fatalf("pickNext: %v", errPick)
+		}
+		return picked.ID
+	}
+	answer := func(id string) {
+		headerCtx := internallogging.WithResponseHeadersHolder(ctx)
+		internallogging.SetResponseHeaders(headerCtx, http.Header{
+			"Anthropic-Ratelimit-Unified-Status":         []string{"allowed"},
+			"Anthropic-Ratelimit-Unified-7d-Utilization": []string{"0.25"},
+			"Anthropic-Ratelimit-Unified-7d-Reset":       []string{unixSignal(now.Add(resets[id]))},
+		})
+		manager.MarkResult(headerCtx, Result{AuthID: id, Provider: "claude", Model: model, Success: true})
+	}
+
+	first := pick()
+	answer(first)
+	// The other account has not been heard from, so it is tried next even though the
+	// first one now has a known reset.
+	second := pick()
+	if second == first {
+		t.Fatalf("second pick = %s again, want the account not heard from yet", second)
+	}
+	answer(second)
+
+	for i := 0; i < 3; i++ {
+		if got := pick(); got != "claude-learn-b" {
+			t.Fatalf("pick %d = %s, want claude-learn-b (resets in 20h)", i, got)
+		}
 	}
 }
