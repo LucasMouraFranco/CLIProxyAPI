@@ -499,6 +499,9 @@ func (h *Host) buildHostAuthFileEntry(auth *coreauth.Auth) *pluginapi.HostAuthFi
 	}
 	if websockets, ok := authWebsocketsValue(auth); ok {
 		entry.Websockets = websockets
+	} else {
+		// Codex OAuth credentials use the upstream websocket transport by default.
+		entry.Websockets = coreauth.WebsocketsEnabled(auth)
 	}
 	return entry
 }

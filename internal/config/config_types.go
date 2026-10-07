@@ -359,7 +359,8 @@ type RoutingConfig struct {
 	// followed by prompt_cache_key, Responses conversation IDs, legacy body IDs,
 	// execution or derived session identity, and the existing message-content hash fallback.
 	// Automatic failover is always enabled when bound auth becomes unavailable.
-	SessionAffinity bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
+	// Default: true (nil means enabled). Set it to false explicitly to disable.
+	SessionAffinity *bool `yaml:"session-affinity,omitempty" json:"session-affinity,omitempty"`
 
 	// SessionAffinityTTL specifies how long session-to-auth bindings are retained.
 	// Default: 1h. Accepts duration strings like "30m", "1h", "2h30m".
@@ -371,6 +372,12 @@ type RoutingConfig struct {
 	// When false, subagents are distributed across the credential pool via the fallback selector.
 	// Default: true. Ignored when SessionAffinity is false.
 	SessionAffinitySubagents *bool `yaml:"session-affinity-subagents,omitempty" json:"session-affinity-subagents,omitempty"`
+}
+
+// SessionAffinityEnabled reports whether session-sticky routing is active.
+// Session affinity is on unless it is explicitly set to false.
+func (r RoutingConfig) SessionAffinityEnabled() bool {
+	return r.SessionAffinity == nil || *r.SessionAffinity
 }
 
 // OAuthModelAlias defines a model ID alias for a specific channel.

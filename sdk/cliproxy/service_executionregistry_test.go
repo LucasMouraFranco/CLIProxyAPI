@@ -2751,7 +2751,7 @@ func TestBuilderPreservesInitialSelectorForSameRouting(t *testing.T) {
 		AuthDir: t.TempDir(),
 		Routing: internalconfig.RoutingConfig{
 			Strategy:           "fill-first",
-			SessionAffinity:    true,
+			SessionAffinity:    boolPtr(true),
 			SessionAffinityTTL: "1h",
 		},
 	}
@@ -2784,7 +2784,7 @@ func TestServiceApplyConfigRuntimePreservesSelectorForUnchangedRouting(t *testin
 
 	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:           "fill-first",
-		SessionAffinity:    true,
+		SessionAffinity:    boolPtr(true),
 		SessionAffinityTTL: "1h",
 	}})
 	if !service.applyConfigRuntime(context.Background(), initial, false) {
@@ -2799,13 +2799,13 @@ func TestServiceApplyConfigRuntimePreservesSelectorForUnchangedRouting(t *testin
 
 	older := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:           " FILLFIRST ",
-		SessionAffinity:    true,
+		SessionAffinity:    boolPtr(true),
 		SessionAffinityTTL: "60m",
 	}})
 	newer := service.commitConfigUpdate(&config.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:           "fill-first",
-			SessionAffinity:    true,
+			SessionAffinity:    boolPtr(true),
 			SessionAffinityTTL: "1h",
 		},
 		UsageStatisticsEnabled: true,
@@ -2825,7 +2825,7 @@ func TestServiceApplyConfigRuntimePreservesSelectorForUnchangedRouting(t *testin
 
 	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:           "round-robin",
-		SessionAffinity:    true,
+		SessionAffinity:    boolPtr(true),
 		SessionAffinityTTL: "1h",
 	}})
 	if !service.applyConfigRuntime(context.Background(), changed, false) {
@@ -2844,7 +2844,7 @@ func TestServiceApplyConfigRuntimePreservesSelectorForUnchangedRouting(t *testin
 	unrelated := service.commitConfigUpdate(&config.Config{
 		Routing: internalconfig.RoutingConfig{
 			Strategy:           "round-robin",
-			SessionAffinity:    true,
+			SessionAffinity:    boolPtr(true),
 			SessionAffinityTTL: "1h",
 		},
 		UsageStatisticsEnabled: false,
@@ -2864,7 +2864,7 @@ func TestServiceApplyConfigRuntimeSessionAffinitySubagentsChangeRecreatesSelecto
 	subagentsEnabled := true
 	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:                 "round-robin",
-		SessionAffinity:          true,
+		SessionAffinity:          boolPtr(true),
 		SessionAffinityTTL:       "1h",
 		SessionAffinitySubagents: &subagentsEnabled,
 	}})
@@ -2876,7 +2876,7 @@ func TestServiceApplyConfigRuntimeSessionAffinitySubagentsChangeRecreatesSelecto
 	subagentsDisabled := false
 	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:                 "round-robin",
-		SessionAffinity:          true,
+		SessionAffinity:          boolPtr(true),
 		SessionAffinityTTL:       "1h",
 		SessionAffinitySubagents: &subagentsDisabled,
 	}})
@@ -2896,7 +2896,7 @@ func TestServiceApplyConfigRuntimeSessionAffinityDisabledSubagentsChangeIsNoOp(t
 	subagentsEnabled := true
 	initial := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:                 "round-robin",
-		SessionAffinity:          false,
+		SessionAffinity:          boolPtr(false),
 		SessionAffinityTTL:       "1h",
 		SessionAffinitySubagents: &subagentsEnabled,
 	}})
@@ -2908,7 +2908,7 @@ func TestServiceApplyConfigRuntimeSessionAffinityDisabledSubagentsChangeIsNoOp(t
 	subagentsDisabled := false
 	changed := service.commitConfigUpdate(&config.Config{Routing: internalconfig.RoutingConfig{
 		Strategy:                 "round-robin",
-		SessionAffinity:          false,
+		SessionAffinity:          boolPtr(false),
 		SessionAffinityTTL:       "1h",
 		SessionAffinitySubagents: &subagentsDisabled,
 	}})

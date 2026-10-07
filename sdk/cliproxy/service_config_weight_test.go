@@ -11,7 +11,7 @@ import (
 
 func TestWeightedRoundRobinRoutingSelector(t *testing.T) {
 	state := normalizedRoutingRuntimeState(&internalconfig.Config{
-		Routing: internalconfig.RoutingConfig{Strategy: "wrr"},
+		Routing: internalconfig.RoutingConfig{Strategy: "wrr", SessionAffinity: boolPtr(false)},
 	})
 	if state.strategy != "weighted-round-robin" {
 		t.Fatalf("strategy = %q, want weighted-round-robin", state.strategy)

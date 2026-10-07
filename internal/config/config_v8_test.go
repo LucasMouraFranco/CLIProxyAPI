@@ -335,7 +335,7 @@ oauth:
 		t.Fatalf("unknown nested field was not preserved as a comment: %s", migrated)
 	}
 	cfg, err := ParseConfigBytes(migrated)
-	if err != nil || cfg.Routing.Strategy != "fill-first" || !cfg.Routing.SessionAffinity || !cfg.Codex.DisableCodexCloaking {
+	if err != nil || cfg.Routing.Strategy != "fill-first" || !cfg.Routing.SessionAffinityEnabled() || cfg.Routing.SessionAffinity == nil || !cfg.Codex.DisableCodexCloaking {
 		t.Fatalf("migration changed known settings: cfg=%+v error=%v", cfg, err)
 	}
 	remigrated, _, err := NormalizeConfigLayout(migrated, true)
