@@ -18,6 +18,8 @@ func CanonicalCredentialMetadataKey(key string) string {
 		return "model_aliases"
 	case "proxy-url":
 		return "proxy_url"
+	case "quota-guard":
+		return "quota_guard"
 	case "request-retry":
 		return "request_retry"
 	case "request-scoped-errors":

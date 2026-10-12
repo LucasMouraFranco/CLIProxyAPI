@@ -472,6 +472,14 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context, pagination authFilesPagi
 			if requestRetry, okRetry := authFileRequestRetryFromJSON(data); okRetry {
 				fileData["request_retry"] = requestRetry
 			}
+			if gv := gjson.GetBytes(data, coreauth.QuotaGuardKey); gv.Exists() {
+				var guardRaw any
+				if errGuard := json.Unmarshal([]byte(gv.Raw), &guardRaw); errGuard == nil {
+					if _, errParse := coreauth.ParseQuotaGuard(guardRaw); errParse == nil {
+						fileData[coreauth.QuotaGuardKey] = guardRaw
+					}
+				}
+			}
 		}
 
 		files = append(files, fileData)
@@ -793,6 +801,13 @@ func (h *Handler) buildAuthFileEntryLocked(auth *coreauth.Auth, quotaSupported .
 	}
 	if requestRetry, ok := auth.RequestRetryOverride(); ok {
 		entry["request_retry"] = requestRetry
+	}
+	if guard := coreauth.QuotaGuardFor(auth); guard != nil {
+		steps := make([]gin.H, 0, len(guard.Steps))
+		for _, step := range guard.Steps {
+			steps = append(steps, gin.H{"hours": step.Hours, "min_remaining": step.MinRemaining})
+		}
+		entry[coreauth.QuotaGuardKey] = gin.H{"enabled": guard.Enabled, "steps": steps}
 	}
 	return entry
 }

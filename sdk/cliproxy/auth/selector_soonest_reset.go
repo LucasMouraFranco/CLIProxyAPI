@@ -296,6 +296,16 @@ func soonestResetCandidateFor(auth *Auth, model string, now time.Time) soonestRe
 	// applies and its next reset is unknown until the next observation.
 	expireQuotaWindow(&candidate.weekly, now)
 	expireQuotaWindow(&candidate.fiveHour, now)
+	if candidate.skipReason == "" {
+		if guard := QuotaGuardFor(auth); guard != nil {
+			weekly := guardWindow(auth, candidate.weekly, now)
+			if weekly.UsedPercent != nil && weekly.ResetAt != nil && weekly.ResetAt.After(now) {
+				if floor, okFloor := guard.FloorFor(weekly.ResetAt.Sub(now)); okFloor && remainingPercent(weekly) <= floor {
+					candidate.skipReason = SoonestResetSkipQuotaGuard
+				}
+			}
+		}
+	}
 	return candidate
 }
 

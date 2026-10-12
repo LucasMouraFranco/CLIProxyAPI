@@ -297,6 +297,25 @@ func (h *Handler) PatchAuthFileFields(c *gin.Context) {
 		return
 	}
 	for key := range req {
+		if root := rootAuthFileField(strings.TrimSpace(key)); (root == coreauth.QuotaGuardKey || root == "quota-guard") && strings.TrimSpace(key) != root {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "quota_guard does not support nested fields"})
+			return
+		}
+	}
+	if rawGuard, present := req[coreauth.QuotaGuardKey]; present {
+		guardValue, errGuardValue := decodeAuthFileFieldValue(rawGuard)
+		if errGuardValue != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid quota_guard"})
+			return
+		}
+		if guardValue != nil {
+			if _, errGuard := coreauth.ParseQuotaGuard(guardValue); errGuard != nil {
+				c.JSON(http.StatusBadRequest, gin.H{"error": errGuard.Error()})
+				return
+			}
+		}
+	}
+	for key := range req {
 		if strings.TrimSpace(key) == "request_retry" {
 			delete(req, key)
 		}
