@@ -1,5 +1,7 @@
-// Package usage keeps in-memory per-credential token totals so the management
-// API can show how each account's prompt cache behaves.
+// Package usage keeps per-credential token totals so the management API can
+// show how each account's prompt cache behaves and how much each account was
+// used. Totals and ten-minute buckets live in memory; hourly buckets are also
+// saved to disk (see credential_history.go) so a week of history survives restarts.
 package usage
 
 import (
@@ -16,6 +18,8 @@ const (
 	CredentialTokenBucketWidth = 10 * time.Minute
 	// CredentialTokenBucketCount is the number of recent buckets kept per credential (3 hours).
 	CredentialTokenBucketCount = 18
+	// CredentialTokenHourlyCount is the number of hourly buckets kept per credential (7 days).
+	CredentialTokenHourlyCount = 7 * 24
 
 	credentialTokenPluginName  = "credential-token-stats"
 	credentialTokenMaxEntries  = 4096
@@ -25,6 +29,7 @@ const (
 // TokenCounts holds non-overlapping token buckets for a set of requests.
 type TokenCounts struct {
 	Requests            int64 `json:"requests"`
+	Failed              int64 `json:"failed"`
 	UncachedInputTokens int64 `json:"uncached_input_tokens"`
 	OutputTokens        int64 `json:"output_tokens"`
 	CacheReadTokens     int64 `json:"cache_read_tokens"`
@@ -43,6 +48,8 @@ type CredentialTokens struct {
 	Since    time.Time     `json:"since"`
 	LastSeen time.Time     `json:"last_seen"`
 	Recent   []TokenBucket `json:"recent"`
+	// Hourly lists only the hours with activity in the last 7 days, oldest first.
+	Hourly []TokenBucket `json:"hourly,omitempty"`
 }
 
 type credentialTokenEntry struct {
@@ -50,6 +57,7 @@ type credentialTokenEntry struct {
 	since    time.Time
 	lastSeen time.Time
 	buckets  [CredentialTokenBucketCount]TokenBucket
+	hourly   [CredentialTokenHourlyCount]TokenBucket
 }
 
 // CredentialTokenStore aggregates usage records by credential ID.
@@ -57,6 +65,8 @@ type CredentialTokenStore struct {
 	mu      sync.Mutex
 	nowFunc func() time.Time
 	entries map[string]*credentialTokenEntry
+	// dirty is set when hourly buckets changed since the last save.
+	dirty bool
 }
 
 // NewCredentialTokenStore creates an empty store using the wall clock.
@@ -96,16 +106,25 @@ func (s *CredentialTokenStore) Record(authID string, counts TokenCounts, at time
 		entry.since = at
 	}
 
-	start := at.Truncate(CredentialTokenBucketWidth)
-	slot := &entry.buckets[bucketSlot(start)]
+	addToRing(entry.buckets[:], at.Truncate(CredentialTokenBucketWidth), CredentialTokenBucketWidth, counts)
+	if addToRing(entry.hourly[:], at.Truncate(time.Hour), time.Hour, counts) {
+		s.dirty = true
+	}
+}
+
+// addToRing adds counts to the ring slot for the window starting at start and
+// reports whether it did. A slot holding an older window is reset first; a
+// record older than the slot's window is too old to bucket and is dropped.
+func addToRing(ring []TokenBucket, start time.Time, width time.Duration, counts TokenCounts) bool {
+	slot := &ring[ringSlot(start, width, len(ring))]
 	if !slot.Time.Equal(start) {
 		if slot.Time.After(start) {
-			// The slot already holds a newer window; this record is too old to bucket.
-			return
+			return false
 		}
 		*slot = TokenBucket{Time: start}
 	}
 	slot.add(counts)
+	return true
 }
 
 // Snapshot returns the credential's totals and its recent buckets ordered oldest
@@ -121,12 +140,13 @@ func (s *CredentialTokenStore) Snapshot(authID string) (CredentialTokens, bool) 
 	if entry == nil {
 		return CredentialTokens{}, false
 	}
-	current := s.now().Truncate(CredentialTokenBucketWidth)
+	now := s.now()
+	current := now.Truncate(CredentialTokenBucketWidth)
 	recent := make([]TokenBucket, CredentialTokenBucketCount)
 	for i := range recent {
 		start := current.Add(-time.Duration(CredentialTokenBucketCount-1-i) * CredentialTokenBucketWidth)
 		recent[i] = TokenBucket{Time: start}
-		if slot := entry.buckets[bucketSlot(start)]; slot.Time.Equal(start) {
+		if slot := entry.buckets[ringSlot(start, CredentialTokenBucketWidth, CredentialTokenBucketCount)]; slot.Time.Equal(start) {
 			recent[i] = slot
 		}
 	}
@@ -135,7 +155,24 @@ func (s *CredentialTokenStore) Snapshot(authID string) (CredentialTokens, bool) 
 		Since:       entry.since,
 		LastSeen:    entry.lastSeen,
 		Recent:      recent,
+		Hourly:      activeHourlyLocked(entry, now),
 	}, true
+}
+
+// activeHourlyLocked returns the entry's hourly buckets with activity in the
+// last CredentialTokenHourlyCount hours, oldest first. Idle hours are left out
+// to keep the payload small; clients fill the gaps.
+func activeHourlyLocked(entry *credentialTokenEntry, now time.Time) []TokenBucket {
+	current := now.Truncate(time.Hour)
+	var out []TokenBucket
+	for i := CredentialTokenHourlyCount - 1; i >= 0; i-- {
+		start := current.Add(-time.Duration(i) * time.Hour)
+		slot := entry.hourly[ringSlot(start, time.Hour, CredentialTokenHourlyCount)]
+		if slot.Time.Equal(start) && slot.Requests > 0 {
+			out = append(out, slot)
+		}
+	}
+	return out
 }
 
 // evictLocked drops the least recently seen credentials once the store is full.
@@ -155,16 +192,17 @@ func (s *CredentialTokenStore) evictLocked() {
 	}
 }
 
-func bucketSlot(start time.Time) int {
-	index := (start.Unix() / int64(CredentialTokenBucketWidth/time.Second)) % CredentialTokenBucketCount
+func ringSlot(start time.Time, width time.Duration, size int) int {
+	index := (start.Unix() / int64(width/time.Second)) % int64(size)
 	if index < 0 {
-		index += CredentialTokenBucketCount
+		index += int64(size)
 	}
 	return int(index)
 }
 
 func (c *TokenCounts) add(other TokenCounts) {
 	c.Requests += other.Requests
+	c.Failed += other.Failed
 	c.UncachedInputTokens += other.UncachedInputTokens
 	c.OutputTokens += other.OutputTokens
 	c.CacheReadTokens += other.CacheReadTokens
@@ -176,8 +214,13 @@ func (c *TokenCounts) add(other TokenCounts) {
 func TokenCountsFromRecord(record coreusage.Record) TokenCounts {
 	detail := coreusage.EnsureTokenBreakdownForProvider(record.Detail, record.Provider, record.ExecutorType)
 	breakdown := detail.TokenBreakdown
+	var failed int64
+	if record.Failed {
+		failed = 1
+	}
 	return TokenCounts{
 		Requests:            1,
+		Failed:              failed,
 		UncachedInputTokens: breakdown.Input.UncachedTokens,
 		OutputTokens:        breakdown.Output.TotalTokens,
 		CacheReadTokens:     breakdown.Input.CacheReadTokens,
