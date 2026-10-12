@@ -5,12 +5,15 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/api"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/home"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/redisqueue"
 	"github.com/router-for-me/CLIProxyAPI/v8/internal/registry"
+	internalusage "github.com/router-for-me/CLIProxyAPI/v8/internal/usage"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/util"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v8/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v8/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v8/sdk/cliproxy/auth"
@@ -55,6 +58,7 @@ func (s *Service) Run(ctx context.Context) error {
 	s.startModelCatalogUpdaters(ctx)
 
 	usage.StartDefault(ctx)
+	internalusage.RunCredentialHistory(ctx, s.credentialHistoryPath())
 	homeEnabled := s.cfg != nil && s.cfg.Home.Enabled
 	if homeEnabled {
 		forceHomeRuntimeConfig(s.cfg)
@@ -367,8 +371,25 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		}
 
 		usage.StopDefault()
+		if path := s.credentialHistoryPath(); path != "" {
+			if errSave := internalusage.SaveCredentialHistory(path); errSave != nil {
+				log.Warnf("usage history: save %s: %v", path, errSave)
+			}
+		}
 	})
 	return shutdownErr
+}
+
+// credentialHistoryPath is where hourly usage history is saved: the writable
+// path when set, otherwise next to the config file. Empty disables saving.
+func (s *Service) credentialHistoryPath() string {
+	if writable := util.WritablePath(); writable != "" {
+		return filepath.Join(writable, internalusage.CredentialHistoryFileName)
+	}
+	if s.configPath == "" {
+		return ""
+	}
+	return filepath.Join(filepath.Dir(s.configPath), internalusage.CredentialHistoryFileName)
 }
 
 func (s *Service) ensureAuthDir() error {
