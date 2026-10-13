@@ -133,6 +133,13 @@ func ParseQuotaGuard(value any) (*QuotaGuard, error) {
 		steps = append(steps, QuotaGuardStep{Hours: hours, MinRemaining: minRemaining})
 	}
 	sort.Slice(steps, func(i, j int) bool { return steps[i].Hours > steps[j].Hours })
+	// Floors must relax (or hold) as the reset approaches; a floor that rises
+	// with time would pause accounts by the clock alone, which surprises.
+	for i := 1; i < len(steps); i++ {
+		if steps[i].MinRemaining > steps[i-1].MinRemaining {
+			return nil, fmt.Errorf("quota_guard.steps must keep less or equal as reset approaches")
+		}
+	}
 	return &QuotaGuard{Enabled: enabled, Steps: steps}, nil
 }
 
