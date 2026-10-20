@@ -71,6 +71,9 @@ type SelectionCandidate struct {
 	SkipReason string       `json:"skip_reason,omitempty"`
 	Weekly     *QuotaWindow `json:"weekly,omitempty"`
 	FiveHour   *QuotaWindow `json:"five_hour,omitempty"`
+	// Fable is Claude's separate 7-day bucket for Fable models, reported whatever the
+	// requested model so dashboards can show it next to the shared windows.
+	Fable *QuotaWindow `json:"fable,omitempty"`
 }
 
 // SelectionPreview reports which credential a routing strategy would choose next for a
@@ -96,6 +99,7 @@ type soonestResetCandidate struct {
 	auth       *Auth
 	weekly     QuotaWindow
 	fiveHour   QuotaWindow
+	fable      QuotaWindow
 	skipReason string
 	// learn marks an unheard-from account that goes ahead of the ranking once.
 	learn bool
@@ -162,6 +166,10 @@ func (s *SoonestResetSelector) PreviewPick(provider, model string, auths []*Auth
 		if candidate.fiveHour.UsedPercent != nil || candidate.fiveHour.ResetAt != nil {
 			fiveHour := candidate.fiveHour
 			entry.FiveHour = &fiveHour
+		}
+		if candidate.fable.UsedPercent != nil || candidate.fable.ResetAt != nil {
+			fable := candidate.fable
+			entry.Fable = &fable
 		}
 		preview.Candidates = append(preview.Candidates, entry)
 	}
@@ -288,7 +296,7 @@ func soonestResetCandidateFor(auth *Auth, model string, now time.Time) soonestRe
 	observedAt := auth.Quota.ObservedAt
 	switch strings.ToLower(strings.TrimSpace(auth.Provider)) {
 	case "claude":
-		candidate.weekly, candidate.fiveHour, candidate.skipReason = claudeQuotaWindows(signals, model, now)
+		candidate.weekly, candidate.fiveHour, candidate.fable, candidate.skipReason = claudeQuotaWindows(signals, claudeFableSignals(auth), model, now)
 	case "codex":
 		candidate.weekly, candidate.fiveHour, candidate.skipReason = codexQuotaWindows(signals, observedAt, now)
 	}
@@ -296,6 +304,7 @@ func soonestResetCandidateFor(auth *Auth, model string, now time.Time) soonestRe
 	// applies and its next reset is unknown until the next observation.
 	expireQuotaWindow(&candidate.weekly, now)
 	expireQuotaWindow(&candidate.fiveHour, now)
+	expireQuotaWindow(&candidate.fable, now)
 	if candidate.skipReason == "" {
 		if guard := QuotaGuardFor(auth); guard != nil {
 			weekly := guardWindow(auth, candidate.weekly, now)
@@ -317,25 +326,49 @@ func expireQuotaWindow(window *QuotaWindow, now time.Time) {
 }
 
 // claudeQuotaWindows reads the Anthropic unified rate-limit headers. Utilization is a
-// fraction (1.0 = 100%) and resets are Unix seconds. The 7d_oi bucket is Fable-specific.
-func claudeQuotaWindows(signals map[string]string, model string, now time.Time) (weekly, fiveHour QuotaWindow, skipReason string) {
+// fraction (1.0 = 100%) and resets are Unix seconds. The 7d_oi bucket is Fable-specific
+// and read from fableSignals, which may come from an older response than signals.
+func claudeQuotaWindows(signals, fableSignals map[string]string, model string, now time.Time) (weekly, fiveHour, fable QuotaWindow, skipReason string) {
 	fiveHour = claudeWindow(signals, "5h", "5h")
 	overall := claudeWindow(signals, "7d", "7d")
 	weekly = overall
-	if isFableModel(model) {
-		if fable := claudeWindow(signals, "7d_oi", "7d_fable"); fable.UsedPercent != nil || fable.ResetAt != nil {
-			weekly = fable
-		}
+	fable = claudeWindow(fableSignals, "7d_oi", "7d_fable")
+	if isFableModel(model) && (fable.UsedPercent != nil || fable.ResetAt != nil) {
+		weekly = fable
 	}
 	switch {
 	case claudeWindowExhausted(signals, "5h", fiveHour, now):
 		skipReason = SoonestResetSkipFiveHourLimit
 	case claudeWindowExhausted(signals, "7d", overall, now):
 		skipReason = SoonestResetSkipWeeklyLimit
-	case weekly.Name == "7d_fable" && claudeWindowExhausted(signals, "7d_oi", weekly, now):
+	case weekly.Name == "7d_fable" && claudeWindowExhausted(fableSignals, "7d_oi", weekly, now):
 		skipReason = SoonestResetSkipWeeklyLimit
 	}
-	return weekly, fiveHour, skipReason
+	return weekly, fiveHour, fable, skipReason
+}
+
+// claudeFableSignals returns the newest observed signals that carry the Fable 7d_oi bucket.
+// Anthropic only sends that bucket on Fable responses and auth.Quota keeps just the latest
+// response, so after any other model it survives only in the Fable model's own state.
+func claudeFableSignals(auth *Auth) map[string]string {
+	var best map[string]string
+	var bestAt time.Time
+	consider := func(quota QuotaState) {
+		if quotaSignal(quota.Signals, "anthropic-ratelimit-unified-7d_oi-utilization") == "" &&
+			quotaSignal(quota.Signals, "anthropic-ratelimit-unified-7d_oi-reset") == "" {
+			return
+		}
+		if best == nil || quota.ObservedAt.After(bestAt) {
+			best, bestAt = quota.Signals, quota.ObservedAt
+		}
+	}
+	consider(auth.Quota)
+	for _, state := range auth.ModelStates {
+		if state != nil {
+			consider(state.Quota)
+		}
+	}
+	return best
 }
 
 func claudeWindow(signals map[string]string, header, name string) QuotaWindow {

@@ -128,6 +128,39 @@ func TestSoonestResetUsesFableBucketForFableModels(t *testing.T) {
 	}
 }
 
+func TestSoonestResetReadsFableBucketFromFableModelState(t *testing.T) {
+	selector := newSoonestResetTestSelector()
+	day := 24 * time.Hour
+	// The latest response came from Opus, so auth.Quota has no Fable bucket. The Fable
+	// bucket lives on in the Fable model's state from an earlier response.
+	a := claudeAuth("claude-a", 0.20, 1*day, 0, 5*time.Hour)
+	a.ModelStates = map[string]*ModelState{
+		"claude-fable-5-1": {Quota: withFableWindow(claudeAuth("", 0.20, 1*day, 0, 5*time.Hour), 1.00, day/2).Quota},
+	}
+	a.ModelStates["claude-fable-5-1"].Quota.ObservedAt = soonestResetTestNow.Add(-time.Hour)
+	b := withFableWindow(claudeAuth("claude-b", 0.20, 3*day, 0, 5*time.Hour), 0.40, 2*day)
+
+	if got := pickSoonestReset(t, selector, "claude", "claude-fable-5-1", a, b); got != "claude-b" {
+		t.Fatalf("Fable pick = %s, want claude-b (claude-a's Fable bucket is exhausted)", got)
+	}
+
+	// Previews report the Fable bucket for any model, next to the shared windows.
+	preview := selector.PreviewPick("claude", "", []*Auth{a, b})
+	fable := map[string]float64{}
+	for _, candidate := range preview.Candidates {
+		if candidate.Fable == nil || candidate.Fable.UsedPercent == nil {
+			t.Fatalf("candidate %s has no Fable window", candidate.AuthID)
+		}
+		if candidate.Weekly == nil || candidate.Weekly.Name != "7d" {
+			t.Fatalf("candidate %s weekly = %#v, want the shared 7d window", candidate.AuthID, candidate.Weekly)
+		}
+		fable[candidate.AuthID] = *candidate.Fable.UsedPercent
+	}
+	if fable["claude-a"] != 100 || fable["claude-b"] != 40 {
+		t.Fatalf("Fable used = %#v, want claude-a 100, claude-b 40", fable)
+	}
+}
+
 func TestSoonestResetTieBreaksByRemainingQuotaThenRoundRobin(t *testing.T) {
 	selector := newSoonestResetTestSelector()
 	day := 24 * time.Hour
