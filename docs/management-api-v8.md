@@ -126,6 +126,10 @@ binding), the `auth_id` that would be picked next, and the available
 `candidates` in selection order. For `soonest-reset`, candidates also carry the
 parsed `weekly` and `five_hour` windows (`used_percent`, `reset_at`) and a
 `skip_reason` (`five_hour_limit` or `weekly_limit`) for accounts it avoids.
+Claude candidates also carry `fable`, the separate Fable 7-day bucket, once the
+account has served a Fable model. Anthropic only reports that bucket on Fable
+responses, so it is read from the newest response that had it. With
+`model=<a Fable model>`, `weekly` is the Fable bucket and drives the ranking.
 A subscription account it has not heard from since startup is listed first,
 without windows, until it has had its one learning pick.
 Credentials that are cooling down are not listed. The preview does not change
